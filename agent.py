@@ -11,7 +11,8 @@ Usage:
 
 import json
 import os
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import requests
 import pypdf
 from bs4 import BeautifulSoup
@@ -22,14 +23,14 @@ FILES_DB = "teacher_files.json"
 PDF_DIR = Path("files_to_feed")
 WEBSITE_URL = "https://awakenology.org/Chinese/"
 TEACHER_NAME = "元吾氏"
+MODEL = "gemini-2.0-flash"
 
 MAX_PAGE_TEXT_CHARS = 3000
 MAX_PAGES_IN_CONTEXT = 30
-MAX_PDF_TEXT_CHARS = 100_000  # per PDF, ~25K tokens each
+MAX_PDF_TEXT_CHARS = 100_000
 
 
 def crawl_website(base_url: str, max_pages: int = 100) -> list[dict]:
-    """BFS-crawl the website. Returns list of {url, title, text}."""
     visited: set[str] = set()
     queue: list[str] = [base_url]
     page_texts: list[dict] = []
@@ -77,7 +78,6 @@ def crawl_website(base_url: str, max_pages: int = 100) -> list[dict]:
 
 
 def extract_pdf_text(pdf_path: Path) -> str:
-    """Extract text from a PDF file using pypdf."""
     try:
         reader = pypdf.PdfReader(str(pdf_path))
         pages = [page.extract_text() or "" for page in reader.pages]
@@ -88,7 +88,6 @@ def extract_pdf_text(pdf_path: Path) -> str:
 
 
 def setup() -> dict:
-    """Build and cache the knowledge base. Reads from cache if available."""
     if os.path.exists(FILES_DB):
         with open(FILES_DB, encoding="utf-8") as f:
             state = json.load(f)
@@ -126,8 +125,8 @@ def setup() -> dict:
 def build_system_instruction(state: dict) -> str:
     teacher_name = state.get("teacher_name", TEACHER_NAME)
     website_url = state.get("website_url", "")
-    page_texts: list[dict] = state.get("page_texts", [])
-    pdf_texts: list[dict] = state.get("pdf_texts", [])
+    page_texts = state.get("page_texts", [])
+    pdf_texts = state.get("pdf_texts", [])
 
     text = f"""你就是{teacher_name}老师本人。学生正在向你请教问题，你要完全以老师本人的身份、口吻和视角来回答，就像在课堂上或办公室里亲自辅导学生一样。
 
@@ -157,27 +156,17 @@ def build_system_instruction(state: dict) -> str:
 
 def chat():
     state = setup()
-
-    api_key = os.environ.get("GEMINI_API_KEY")
-    genai.configure(api_key=api_key)
-
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     system_instruction = build_system_instruction(state)
-    model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        system_instruction=system_instruction,
-    )
 
     teacher_name = state.get("teacher_name", TEACHER_NAME)
-    pdf_count = len(state.get("pdf_texts", []))
-    page_count = len(state.get("page_texts", []))
-
     print(f"\n{'='*50}")
     print(f"  {teacher_name}老师 (AI助教)")
-    print(f"  已加载 {pdf_count} 份讲义 + {page_count} 个课程网页")
+    print(f"  已加载 {len(state.get('pdf_texts', []))} 份讲义 + {len(state.get('page_texts', []))} 个课程网页")
     print(f"  输入 'quit' 或 '退出' 结束对话")
     print(f"{'='*50}\n")
 
-    chat_session = model.start_chat()
+    history = []
 
     while True:
         try:
@@ -192,16 +181,29 @@ def chat():
             print("再见！")
             break
 
+        history.append({"role": "user", "parts": [{"text": user_input}]})
+
         print("助教: ", end="", flush=True)
+        response_text = ""
         try:
-            response = chat_session.send_message(user_input, stream=True)
-            for chunk in response:
+            stream = client.models.generate_content_stream(
+                model=MODEL,
+                contents=history,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                ),
+            )
+            for chunk in stream:
                 if chunk.text:
                     print(chunk.text, end="", flush=True)
+                    response_text += chunk.text
         except Exception as e:
             print(f"\n❌ 出错了: {e}")
+            history.pop()
+            continue
 
         print("\n")
+        history.append({"role": "model", "parts": [{"text": response_text}]})
 
 
 if __name__ == "__main__":
