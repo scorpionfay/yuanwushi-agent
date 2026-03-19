@@ -78,7 +78,7 @@ def _build_doc_blocks(state: dict) -> list[dict]:
 
 def response_stream(client, system_blocks, messages):
     """Generator that yields text chunks from the Anthropic streaming API."""
-    with client.messages.stream(
+    with client.beta.messages.stream(
         model="claude-opus-4-6",
         max_tokens=2048,
         system=system_blocks,

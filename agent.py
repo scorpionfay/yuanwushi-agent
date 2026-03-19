@@ -212,7 +212,7 @@ def chat():
         response_text = ""
 
         try:
-            with client.messages.stream(
+            with client.beta.messages.stream(
                 model="claude-opus-4-6",
                 max_tokens=2048,
                 system=system_blocks,
