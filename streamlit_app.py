@@ -17,6 +17,7 @@ FILES_DB = "teacher_files.json"
 TEACHER_NAME = "元吾氏"
 MODEL = "gemini-2.5-flash"
 TOP_K = 8
+MAX_HISTORY_TURNS = 10  # keep last N turns in API history
 
 
 def build_system_instruction(state: dict) -> str:
@@ -54,8 +55,15 @@ def load_resources():
     return state, client, system_instruction, chunks, bm25
 
 
-def retrieve_context(query: str, chunks: list[dict], bm25: BM25Okapi) -> str:
-    query_tokens = list(jieba.cut(query))
+def retrieve_context(query: str, history: list, chunks: list[dict], bm25: BM25Okapi) -> str:
+    # Combine current query with last 2 assistant turns for better follow-up retrieval
+    recent = " ".join(
+        part["text"]
+        for msg in history[-4:]
+        for part in msg.get("parts", [])
+    )
+    search_text = query + " " + recent
+    query_tokens = list(jieba.cut(search_text))
     scores = bm25.get_scores(query_tokens)
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:TOP_K]
     parts = [f"[{chunks[i]['source']}]\n{chunks[i]['text']}" for i in top_indices]
@@ -79,7 +87,8 @@ def main():
     st.set_page_config(page_title="元吾氏 AI助教", page_icon="📚")
     st.title("📚 元吾氏 AI助教")
 
-    state, client, system_instruction, chunks, bm25 = load_resources()
+    with st.spinner("正在加载知识库…"):
+        state, client, system_instruction, chunks, bm25 = load_resources()
     st.caption(f"知识库：{len(chunks)} 个文本块，每次检索最相关的 {TOP_K} 块")
 
     # Per-session state
@@ -100,10 +109,13 @@ def main():
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Retrieve relevant chunks and augment current message
-    context = retrieve_context(user_input, chunks, bm25)
+    # Retrieve relevant chunks (using query + recent history for follow-up awareness)
+    context = retrieve_context(user_input, st.session_state.history, chunks, bm25)
     augmented = f"以下是可能相关的参考内容：\n\n{context}\n\n---\n\n问题：{user_input}"
-    api_messages = st.session_state.history + [{"role": "user", "parts": [{"text": augmented}]}]
+
+    # Trim history to last N turns to prevent unbounded growth
+    trimmed_history = st.session_state.history[-(MAX_HISTORY_TURNS * 2):]
+    api_messages = trimmed_history + [{"role": "user", "parts": [{"text": augmented}]}]
 
     with st.chat_message("assistant"):
         try:

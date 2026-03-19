@@ -30,6 +30,7 @@ MODEL = "gemini-2.5-flash"
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 100
 TOP_K = 8  # chunks to retrieve per query
+MAX_HISTORY_TURNS = 10  # keep last N turns in API history
 
 
 # ── Text processing ────────────────────────────────────────────────────────────
@@ -62,16 +63,23 @@ def build_bm25_index(chunks: list[dict]) -> BM25Okapi:
     return index
 
 
-def retrieve_context(query: str, chunks: list[dict], bm25: BM25Okapi) -> str:
-    query_tokens = list(jieba.cut(query))
+def retrieve_context(query: str, history: list, chunks: list[dict], bm25: BM25Okapi) -> str:
+    # Combine current query with recent history for better follow-up retrieval
+    recent = " ".join(
+        part["text"]
+        for msg in history[-4:]
+        for part in msg.get("parts", [])
+    )
+    search_text = query + " " + recent
+    query_tokens = list(jieba.cut(search_text))
     scores = bm25.get_scores(query_tokens)
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:TOP_K]
     parts = [f"[{chunks[i]['source']}]\n{chunks[i]['text']}" for i in top_indices]
     return "\n\n---\n\n".join(parts)
 
 
-def augment_message(user_input: str, chunks: list[dict], bm25: BM25Okapi) -> str:
-    context = retrieve_context(user_input, chunks, bm25)
+def augment_message(user_input: str, history: list, chunks: list[dict], bm25: BM25Okapi) -> str:
+    context = retrieve_context(user_input, history, chunks, bm25)
     return f"以下是可能相关的参考内容：\n\n{context}\n\n---\n\n问题：{user_input}"
 
 
@@ -239,9 +247,10 @@ def chat():
             print("再见！")
             break
 
-        # Retrieve relevant context and augment the current message
-        augmented = augment_message(user_input, chunks, bm25)
-        api_messages = history + [{"role": "user", "parts": [{"text": augmented}]}]
+        # Retrieve relevant context (query + recent history for follow-up awareness)
+        augmented = augment_message(user_input, history, chunks, bm25)
+        trimmed_history = history[-(MAX_HISTORY_TURNS * 2):]
+        api_messages = trimmed_history + [{"role": "user", "parts": [{"text": augmented}]}]
 
         print("助教: ", end="", flush=True)
         response_text = ""
