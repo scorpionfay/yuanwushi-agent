@@ -23,7 +23,7 @@ FILES_DB = "teacher_files.json"
 PDF_DIR = Path("files_to_feed")
 WEBSITE_URL = "https://awakenology.org/Chinese/"
 TEACHER_NAME = "元吾氏"
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
 
 MAX_PAGE_TEXT_CHARS = 3000
 MAX_PAGES_IN_CONTEXT = 30

@@ -13,7 +13,7 @@ from google.genai import types
 
 FILES_DB = "teacher_files.json"
 TEACHER_NAME = "元吾氏"
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
 MAX_PAGE_TEXT_CHARS = 3000
 MAX_PAGES_IN_CONTEXT = 30
 MAX_PDF_TEXT_CHARS = 100_000
