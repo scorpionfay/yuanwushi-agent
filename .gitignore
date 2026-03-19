@@ -1,0 +1,5 @@
+files_to_feed/
+downloaded_materials/
+__pycache__/
+*.pyc
+.env
