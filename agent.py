@@ -1,7 +1,7 @@
 """
-agent.py — Teacher AI agent for 元吾氏.
+agent.py — Teacher AI agent for 元吾氏 (powered by Google Gemini).
 
-On first run, uploads PDFs from ./files_to_feed/ and crawls
+On first run, extracts text from PDFs in ./files_to_feed/ and crawls
 https://awakenology.org/Chinese/ to build the knowledge base.
 State is cached to teacher_files.json for subsequent runs.
 
@@ -11,8 +11,9 @@ Usage:
 
 import json
 import os
-import anthropic
+import google.generativeai as genai
 import requests
+import pypdf
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
@@ -24,6 +25,7 @@ TEACHER_NAME = "元吾氏"
 
 MAX_PAGE_TEXT_CHARS = 3000
 MAX_PAGES_IN_CONTEXT = 30
+MAX_PDF_TEXT_CHARS = 100_000  # per PDF, ~25K tokens each
 
 
 def crawl_website(base_url: str, max_pages: int = 100) -> list[dict]:
@@ -74,47 +76,45 @@ def crawl_website(base_url: str, max_pages: int = 100) -> list[dict]:
     return page_texts
 
 
-def upload_local_pdfs(client: anthropic.Anthropic, existing_file_ids: dict) -> dict:
-    """Upload PDFs from PDF_DIR to Files API, skipping already-uploaded ones."""
-    file_ids = dict(existing_file_ids)
-    for pdf_path in sorted(PDF_DIR.glob("*.pdf")):
-        key = str(pdf_path)
-        if key in file_ids:
-            print(f"  ✅ 已上传 (跳过): {pdf_path.name}")
-            continue
-        print(f"  📤 上传: {pdf_path.name}")
-        try:
-            with open(pdf_path, "rb") as f:
-                result = client.beta.files.upload(
-                    file=(pdf_path.name, f, "application/pdf"),
-                )
-            file_ids[key] = {"file_id": result.id, "filename": pdf_path.name}
-            print(f"     ✅ file_id: {result.id}")
-        except Exception as e:
-            print(f"  ⚠️  上传失败 {pdf_path.name}: {e}")
-    return file_ids
+def extract_pdf_text(pdf_path: Path) -> str:
+    """Extract text from a PDF file using pypdf."""
+    try:
+        reader = pypdf.PdfReader(str(pdf_path))
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n".join(pages).strip()
+    except Exception as e:
+        print(f"  ⚠️  无法提取 {pdf_path.name}: {e}")
+        return ""
 
 
-def setup(client: anthropic.Anthropic) -> dict:
+def setup() -> dict:
     """Build and cache the knowledge base. Reads from cache if available."""
     if os.path.exists(FILES_DB):
         with open(FILES_DB, encoding="utf-8") as f:
             state = json.load(f)
-        print(f"📂 加载已有数据: {len(state.get('file_ids', {}))} 个已上传文件")
+        print(f"📂 加载已有数据: {len(state.get('pdf_texts', []))} 份讲义 + {len(state.get('page_texts', []))} 个网页")
         return state
 
     print(f"🔍 正在爬取网站: {WEBSITE_URL}")
     page_texts = crawl_website(WEBSITE_URL)
     print(f"   共找到 {len(page_texts)} 个网页")
 
-    print(f"\n📚 正在上传 {PDF_DIR}/ 中的PDF…")
-    file_ids = upload_local_pdfs(client, {})
+    print(f"\n📚 正在提取 {PDF_DIR}/ 中的PDF文本…")
+    pdf_texts = []
+    for pdf_path in sorted(PDF_DIR.glob("*.pdf")):
+        print(f"  📄 提取: {pdf_path.name}")
+        text = extract_pdf_text(pdf_path)
+        if text:
+            pdf_texts.append({"filename": pdf_path.name, "text": text})
+            print(f"     ✅ 提取了 {len(text):,} 字符")
+        else:
+            print(f"     ⚠️  未能提取文本（可能是扫描版PDF）")
 
     state = {
         "teacher_name": TEACHER_NAME,
         "website_url": WEBSITE_URL,
         "page_texts": page_texts,
-        "file_ids": file_ids,
+        "pdf_texts": pdf_texts,
     }
 
     with open(FILES_DB, "w", encoding="utf-8") as f:
@@ -123,12 +123,13 @@ def setup(client: anthropic.Anthropic) -> dict:
     return state
 
 
-def build_system_prompt(state: dict) -> list[dict]:
+def build_system_instruction(state: dict) -> str:
     teacher_name = state.get("teacher_name", TEACHER_NAME)
-    website_url = state.get("website_url", WEBSITE_URL)
+    website_url = state.get("website_url", "")
     page_texts: list[dict] = state.get("page_texts", [])
+    pdf_texts: list[dict] = state.get("pdf_texts", [])
 
-    intro = f"""你就是{teacher_name}老师本人。学生正在向你请教问题，你要完全以老师本人的身份、口吻和视角来回答，就像在课堂上或办公室里亲自辅导学生一样。
+    text = f"""你就是{teacher_name}老师本人。学生正在向你请教问题，你要完全以老师本人的身份、口吻和视角来回答，就像在课堂上或办公室里亲自辅导学生一样。
 
 角色要求：
 - 用第一人称"我"来表达，比如"我在课上讲过……""我的意思是……""你可以翻翻我给你们的讲义第X页"
@@ -139,42 +140,35 @@ def build_system_prompt(state: dict) -> list[dict]:
 - 可以适当反问学生，帮助他们自己思考，而不只是直接给答案
 - 不要说"根据材料""文档中提到"这类话——那是你自己写的内容，直接讲就好"""
 
-    blocks: list[dict] = [{"type": "text", "text": intro}]
+    if pdf_texts:
+        text += "\n\n## 课程讲义内容\n\n"
+        for pdf in pdf_texts:
+            text += f"### {pdf['filename']}\n{pdf['text'][:MAX_PDF_TEXT_CHARS]}\n\n"
 
     if page_texts:
-        pages_block = f"\n\n## 课程网站内容（来源: {website_url}）\n\n"
+        text += f"\n\n## 课程网站内容（来源: {website_url}）\n\n"
         for page in page_texts[:MAX_PAGES_IN_CONTEXT]:
             title = page.get("title", page["url"])
-            text = page["text"][:MAX_PAGE_TEXT_CHARS]
-            pages_block += f"### {title}\n{text}\n\n"
+            content = page["text"][:MAX_PAGE_TEXT_CHARS]
+            text += f"### {title}\n{content}\n\n"
 
-        blocks.append({
-            "type": "text",
-            "text": pages_block,
-            "cache_control": {"type": "ephemeral"},
-        })
-
-    return blocks
-
-
-def build_initial_doc_blocks(state: dict) -> list[dict]:
-    """One document block per PDF, injected into the first user turn only."""
-    return [
-        {
-            "type": "document",
-            "source": {"type": "file", "file_id": info["file_id"]},
-            "title": info["filename"],
-        }
-        for info in state.get("file_ids", {}).values()
-    ]
+    return text
 
 
 def chat():
-    client = anthropic.Anthropic()
-    state = setup(client)
+    state = setup()
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    genai.configure(api_key=api_key)
+
+    system_instruction = build_system_instruction(state)
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        system_instruction=system_instruction,
+    )
 
     teacher_name = state.get("teacher_name", TEACHER_NAME)
-    pdf_count = len(state.get("file_ids", {}))
+    pdf_count = len(state.get("pdf_texts", []))
     page_count = len(state.get("page_texts", []))
 
     print(f"\n{'='*50}")
@@ -183,9 +177,7 @@ def chat():
     print(f"  输入 'quit' 或 '退出' 结束对话")
     print(f"{'='*50}\n")
 
-    system_blocks = build_system_prompt(state)
-    doc_blocks = build_initial_doc_blocks(state)
-    messages: list[dict] = []
+    chat_session = model.start_chat()
 
     while True:
         try:
@@ -200,39 +192,16 @@ def chat():
             print("再见！")
             break
 
-        # First turn: prepend PDF document blocks; they stay in history afterward
-        if not messages and doc_blocks:
-            content = doc_blocks + [{"type": "text", "text": user_input}]
-        else:
-            content = user_input
-
-        messages.append({"role": "user", "content": content})
-
         print("助教: ", end="", flush=True)
-        response_text = ""
-
         try:
-            with client.beta.messages.stream(
-                model="claude-opus-4-6",
-                max_tokens=2048,
-                system=system_blocks,
-                messages=messages,
-                betas=["files-api-2025-04-14"],
-            ) as stream:
-                for text in stream.text_stream:
-                    print(text, end="", flush=True)
-                    response_text += text
-        except anthropic.BadRequestError as e:
-            print(f"\n❌ 请求错误: {e.message}")
-            messages.pop()
-            continue
-        except anthropic.RateLimitError:
-            print("\n⚠️  请求太频繁，请稍后再试")
-            messages.pop()
-            continue
+            response = chat_session.send_message(user_input, stream=True)
+            for chunk in response:
+                if chunk.text:
+                    print(chunk.text, end="", flush=True)
+        except Exception as e:
+            print(f"\n❌ 出错了: {e}")
 
         print("\n")
-        messages.append({"role": "assistant", "content": response_text})
 
 
 if __name__ == "__main__":
