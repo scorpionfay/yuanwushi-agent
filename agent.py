@@ -25,7 +25,7 @@ FILES_DB = "teacher_files.json"
 PDF_DIR = Path("files_to_feed")
 WEBSITE_URL = "https://awakenology.org/Chinese/"
 TEACHER_NAME = "元吾氏"
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.1-flash-lite-preview"
 
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 100

@@ -15,7 +15,7 @@ from google.genai import types
 
 FILES_DB = "teacher_files.json"
 TEACHER_NAME = "元吾氏"
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.1-flash-lite-preview"
 TOP_K = 8
 MAX_HISTORY_TURNS = 10  # keep last N turns in API history
 
