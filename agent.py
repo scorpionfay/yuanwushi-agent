@@ -198,12 +198,7 @@ def setup() -> dict:
 
 def build_system_instruction(state: dict) -> str:
     teacher_name = state.get("teacher_name", TEACHER_NAME)
-    return f"""你是{teacher_name}老师的AI助教，帮助学生理解{teacher_name}老师的教学内容。
-
-回答风格：
-- 简明扼要，不废话
-- 用要点、次点、编号（一、二、三或1. 2. 3.）把内容分层说清楚
-- 能用三句话说完就不用五句话"""
+    return f"你是{teacher_name}老师的AI助教，帮助学生理解{teacher_name}老师的教学内容。"
 
 
 # ── Chat loop ──────────────────────────────────────────────────────────────────
