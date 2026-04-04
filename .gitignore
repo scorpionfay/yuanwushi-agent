@@ -3,3 +3,7 @@ downloaded_materials/
 __pycache__/
 *.pyc
 .env
+teacher_files.json
+teacher_embeddings.npy
+feedback_log.jsonl
+.DS_Store

@@ -1,7 +1,7 @@
-google-genai>=0.8.0
-streamlit>=1.35.0
+anthropic>=0.40.0
 requests
 beautifulsoup4
 pypdf
-rank_bm25
-jieba
+sentence-transformers>=3.0.0
+faiss-cpu>=1.7.4
+numpy>=1.24.0
