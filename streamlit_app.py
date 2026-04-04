@@ -108,6 +108,31 @@ def log_feedback(question: str, answer: str, rating: str, comment: str = ""):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _render_feedback_row(msg: dict):
+    """Render 👍 👎 buttons for one assistant message. Uses msg content as unique key."""
+    fkey = str(hash(msg["content"]))
+    if fkey in st.session_state.feedback_done:
+        st.caption("✅ 已收到反馈，谢谢！")
+        return
+
+    col1, col2, col3 = st.columns([1, 1, 8])
+    if col1.button("👍", key=f"good_{fkey}"):
+        log_feedback(msg.get("question", ""), msg["content"], "good")
+        st.session_state.feedback_done.add(fkey)
+        st.rerun()
+    if col2.button("👎", key=f"bad_{fkey}"):
+        st.session_state[f"show_comment_{fkey}"] = True
+        st.rerun()
+
+    if st.session_state.get(f"show_comment_{fkey}"):
+        comment = st.text_input("请简述问题所在（可选）：", key=f"comment_{fkey}")
+        if st.button("提交", key=f"submit_{fkey}"):
+            log_feedback(msg.get("question", ""), msg["content"], "bad", comment)
+            st.session_state.feedback_done.add(fkey)
+            st.session_state.pop(f"show_comment_{fkey}", None)
+            st.rerun()
+
+
 def stream_response(client: anthropic.Anthropic, system_instruction: str, api_messages: list):
     with client.messages.stream(
         model=MODEL,
@@ -128,36 +153,16 @@ def main():
 
     if "history" not in st.session_state:
         st.session_state.history = []
-        st.session_state.messages = []  # {role, content, feedback_key?}
-        st.session_state.feedback_done = set()  # keys that already got feedback
+        st.session_state.messages = []   # {role, content, question?}
+        st.session_state.feedback_done = set()
 
-    # Render chat history with feedback buttons for assistant messages
-    for i, msg in enumerate(st.session_state.messages):
+    # Render full chat history
+    for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-        if msg["role"] == "assistant" and "feedback_key" in msg:
-            fkey = msg["feedback_key"]
-            if fkey not in st.session_state.feedback_done:
-                q = msg.get("question", "")
-                col1, col2, col3 = st.columns([1, 1, 8])
-                if col1.button("👍", key=f"good_{fkey}"):
-                    log_feedback(q, msg["content"], "good")
-                    st.session_state.feedback_done.add(fkey)
-                    st.rerun()
-                if col2.button("👎", key=f"bad_{fkey}"):
-                    st.session_state[f"show_comment_{fkey}"] = True
-                    st.rerun()
-            else:
-                st.caption("✅ 已收到反馈，谢谢！")
-
-            # Comment box for thumbs-down
-            if st.session_state.get(f"show_comment_{fkey}"):
-                comment = st.text_input("请简述问题所在（可选）：", key=f"comment_{fkey}")
-                if st.button("提交反馈", key=f"submit_{fkey}"):
-                    log_feedback(msg.get("question", ""), msg["content"], "bad", comment)
-                    st.session_state.feedback_done.add(fkey)
-                    st.session_state.pop(f"show_comment_{fkey}", None)
-                    st.rerun()
+        # Show feedback buttons for past assistant messages
+        if msg["role"] == "assistant":
+            _render_feedback_row(msg)
 
     user_input = st.chat_input("请输入你的问题…")
     if not user_input:
@@ -183,15 +188,13 @@ def main():
             st.session_state.messages.pop()
             return
 
-    feedback_key = str(len(st.session_state.messages))
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": response_text,
-        "feedback_key": feedback_key,
-        "question": user_input,
-    })
+    new_msg = {"role": "assistant", "content": response_text, "question": user_input}
+    st.session_state.messages.append(new_msg)
     st.session_state.history.append({"role": "user", "content": user_input})
     st.session_state.history.append({"role": "assistant", "content": response_text})
+
+    # Show feedback buttons immediately after streaming (same render cycle)
+    _render_feedback_row(new_msg)
 
 
 if __name__ == "__main__":
