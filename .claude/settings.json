@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cmd=$(jq -r '.tool_input.command // \"\"' 2>/dev/null); if echo \"$cmd\" | grep -qE 'git add.*\\.npy|git add -A|git add \\.'; then echo '{\"systemMessage\": \"⚠️  警告：teacher_embeddings.npy 是大型二进制文件，已在 .gitignore 中排除。请确认不要提交它。\"}'; fi",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
