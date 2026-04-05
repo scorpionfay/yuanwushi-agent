@@ -30,7 +30,7 @@ WEBSITE_URLS = [
     "https://www.awakenology.org/English/",
 ]
 TEACHER_NAME = "元吾氏"
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-haiku-4-5-20251001"
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
 CHUNK_SIZE = 600  # max chars per chunk
