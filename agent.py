@@ -8,6 +8,7 @@ Usage:
 
 import json
 import os
+import re
 import datetime
 import sys
 import anthropic
@@ -32,8 +33,7 @@ TEACHER_NAME = "元吾氏"
 MODEL = "claude-sonnet-4-6"
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
-CHUNK_SIZE = 600
-CHUNK_OVERLAP = 100
+CHUNK_SIZE = 600  # max chars per chunk
 TOP_K = 8               # chunks to retrieve per query
 MAX_HISTORY_TURNS = 10  # keep last N turns in API history
 MIN_RETRIEVAL_SCORE = 0.3  # cosine similarity threshold (0-1); below this = not relevant
@@ -42,13 +42,52 @@ MIN_RETRIEVAL_SCORE = 0.3  # cosine similarity threshold (0-1); below this = not
 # ── Text processing ────────────────────────────────────────────────────────────
 
 def chunk_text(text: str, source: str) -> list[dict]:
+    """Split text at paragraph/sentence boundaries to avoid mid-sentence cuts."""
+    # Split into paragraphs first; fall back to sentences for dense text
+    paragraphs = [p.strip() for p in re.split(r'\n{2,}', text) if p.strip()]
+    if len(paragraphs) < 3:
+        paragraphs = [s.strip() for s in re.split(r'(?<=[。！？.!?])\s+', text) if s.strip()]
+
     chunks = []
-    start = 0
-    while start < len(text):
-        chunk = text[start:start + CHUNK_SIZE]
-        if len(chunk.strip()) > 50:
-            chunks.append({"text": chunk, "source": source})
-        start += CHUNK_SIZE - CHUNK_OVERLAP
+    buffer: list[str] = []
+    buffer_len = 0
+
+    def flush(buf: list[str]) -> None:
+        joined = "\n\n".join(buf).strip()
+        if len(joined) > 50:
+            chunks.append({"text": joined, "source": source})
+
+    for para in paragraphs:
+        # Paragraph itself exceeds limit — split by sentences
+        if len(para) > CHUNK_SIZE:
+            if buffer:
+                flush(buffer)
+                buffer, buffer_len = [], 0
+            sents = re.split(r'(?<=[。！？.!?])\s*', para)
+            sub: list[str] = []
+            sub_len = 0
+            for sent in sents:
+                if sub_len + len(sent) > CHUNK_SIZE and sub:
+                    flush(sub)
+                    sub, sub_len = sub[-1:], len(sub[-1])  # last sentence as overlap
+                sub.append(sent)
+                sub_len += len(sent)
+            if sub:
+                flush(sub)
+            continue
+
+        # Adding this paragraph would exceed limit — flush first
+        if buffer_len + len(para) > CHUNK_SIZE and buffer:
+            flush(buffer)
+            buffer = buffer[-1:]          # keep last paragraph as overlap
+            buffer_len = len(buffer[0]) if buffer else 0
+
+        buffer.append(para)
+        buffer_len += len(para)
+
+    if buffer:
+        flush(buffer)
+
     return chunks
 
 
@@ -272,8 +311,9 @@ def build_system_instruction(state: dict, feedback_summary: str = "") -> str:
 2. 如果材料中确实找不到相关内容，直接告诉学生："这个问题在老师现有的材料中没有找到，建议直接向老师请教。" 不要编造。
 3. 来源引用灵活处理：当内容来自某本书或某篇文章时，自然地提一下出处即可（如"老师在意识强度一书中提到……"），不必每句话都标注。
 4. 讲解时可以有教学温度——适当引导学生思考、帮助他们建立概念之间的联系，但不做主观价值判断，不替学生下结论。
-5. 严禁混入任何宗教内容、宗教术语或宗教类比（佛教、道教、基督教、伊斯兰教等），老师的体系是独立的，不与任何宗教挂钩。
-6. 不要把其他思想体系、哲学流派或心理学理论混入老师的观点中，保持老师体系的纯粹性。"""
+5. 回答格式因问题而异：概念性问题（"什么是X""X是如何运作的"）用清晰的标题和要点组织，便于扫读；简单的追问或对话式问题直接自然作答，不要强行加标题。
+6. 严禁混入任何宗教内容、宗教术语或宗教类比（佛教、道教、基督教、伊斯兰教等），老师的体系是独立的，不与任何宗教挂钩。
+7. 不要把其他思想体系、哲学流派或心理学理论混入老师的观点中，保持老师体系的纯粹性。"""
 
     if feedback_summary:
         base += f"\n\n【根据用户反馈的改进要求】\n{feedback_summary}"
