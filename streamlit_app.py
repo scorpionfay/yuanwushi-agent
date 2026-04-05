@@ -10,8 +10,6 @@ import os
 import datetime
 import numpy as np
 import faiss
-import jieba
-from rank_bm25 import BM25Okapi
 import anthropic
 import streamlit as st
 from sentence_transformers import SentenceTransformer
@@ -20,97 +18,75 @@ FILES_DB = "teacher_files.json"
 EMBEDDINGS_DB = "teacher_embeddings.npy"
 FEEDBACK_LOG = "feedback_log.jsonl"
 TEACHER_NAME = "元吾氏"
-MODEL = "claude-haiku-4-5-20251001"
+MODEL = "claude-sonnet-4-6"
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 TOP_K = 8
-RRF_K = 60
 MAX_HISTORY_TURNS = 10
-MIN_RETRIEVAL_SCORE = 0.2
+MIN_RETRIEVAL_SCORE = 0.3
 
 
 def build_system_instruction(state: dict) -> str:
     teacher_name = state.get("teacher_name", TEACHER_NAME)
     return f"""你是{teacher_name}老师的AI助教，熟悉老师的整套教学体系，帮助学生理解和消化老师的教学内容。
 
-【重要：消息格式说明】
-每条用户消息会包含系统自动注入的「老师材料」背景片段，供你参考。这些材料是后台检索系统提供的，不是学生发送的——不要提及你看到了材料或文档，直接基于材料内容自然地回答学生的问题即可。
-
 【核心原则】
 1. 以提供的「老师材料」为依据来回答问题。用自己的语言自然地讲解、归纳和总结，不需要逐字引用，但内容必须忠实于老师的原意。
 2. 如果材料中确实找不到相关内容，直接告诉学生："这个问题在老师现有的材料中没有找到，建议直接向老师请教。" 不要编造。
 3. 来源引用灵活处理：当内容来自某本书或某篇文章时，自然地提一下出处即可（如"老师在意识强度一书中提到……"），不必每句话都标注。
 4. 讲解时可以有教学温度——适当引导学生思考、帮助他们建立概念之间的联系，但不做主观价值判断，不替学生下结论。
-5. 回答格式因问题而异：概念性问题（"什么是X""X是如何运作的"）用清晰的标题和要点组织，便于扫读；简单的追问或对话式问题直接自然作答，不要强行加标题。如果材料中有具体数字、比例或规模描述，务必在回答中提及，这些数据是老师体系中重要的参考依据。
+5. 回答格式因问题而异：概念性问题（"什么是X""X是如何运作的"）用清晰的标题和要点组织，便于扫读；简单的追问或对话式问题直接自然作答，不要强行加标题。
 6. 严禁混入任何宗教内容、宗教术语或宗教类比（佛教、道教、基督教、伊斯兰教等），老师的体系是独立的，不与任何宗教挂钩。
-7. 不要把其他思想体系、哲学流派或心理学理论混入老师的观点中，保持老师体系的纯粹性。
-8. 引用数字时必须明确该数字对应的具体指标——老师材料中有大量针对不同子检测点的量化数据（如各区检测点的百分比），这些是特定子指标的数值，不能混用或张冠李戴。例如：某个子检测点的"人类平均40%"不等于"人类平均意识强度为40%"；意识强度的整体等级用"级"衡量，人类平均约为3级。"""
+7. 不要把其他思想体系、哲学流派或心理学理论混入老师的观点中，保持老师体系的纯粹性。"""
 
 
-@st.cache_resource(show_spinner="正在加载知识库和混合检索模型…")
+@st.cache_resource(show_spinner="正在加载知识库和语义检索模型…")
 def load_resources():
-    """Load chunks, embeddings, build FAISS + BM25 indexes. Runs once per instance."""
+    """Load chunks, embeddings, build FAISS index. Runs once per instance."""
     with open(FILES_DB, encoding="utf-8") as f:
         state = json.load(f)
     chunks = state.get("chunks", [])
 
     embeddings = np.load(EMBEDDINGS_DB).astype(np.float32)
     dim = embeddings.shape[1]
-    faiss_index = faiss.IndexFlatIP(dim)
-    faiss_index.add(embeddings)
-
-    corpus = [list(jieba.cut(c["text"])) for c in chunks]
-    bm25 = BM25Okapi(corpus)
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
 
     embed_model = SentenceTransformer(EMBED_MODEL)
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
     system_instruction = build_system_instruction(state)
 
-    return state, client, system_instruction, chunks, faiss_index, bm25, embed_model
-
-
-def _rrf_combine(ranked_lists: list[list[int]]) -> list[int]:
-    scores: dict[int, float] = {}
-    for ranked in ranked_lists:
-        for rank, idx in enumerate(ranked):
-            scores[idx] = scores.get(idx, 0.0) + 1.0 / (RRF_K + rank + 1)
-    return sorted(scores, key=lambda i: scores[i], reverse=True)
+    return state, client, system_instruction, chunks, index, embed_model
 
 
 def retrieve_context(
     query: str,
     history: list,
     chunks: list,
-    faiss_index: faiss.IndexFlatIP,
+    index: faiss.IndexFlatIP,
     embed_model: SentenceTransformer,
-    bm25: BM25Okapi,
 ) -> tuple[str, bool]:
     recent_user_qs = " ".join(
         msg["content"] for msg in history[-4:]
         if msg.get("role") == "user" and isinstance(msg["content"], str)
     )
     search_text = (query + " " + recent_user_qs).strip()
-
     query_vec = embed_model.encode([search_text], normalize_embeddings=True).astype(np.float32)
-    sem_scores, sem_indices = faiss_index.search(query_vec, TOP_K)
-    semantic_ranked = [
-        int(idx) for score, idx in zip(sem_scores[0], sem_indices[0])
+    scores, indices = index.search(query_vec, TOP_K)
+
+    relevant = [
+        (score, idx)
+        for score, idx in zip(scores[0], indices[0])
         if score >= MIN_RETRIEVAL_SCORE and idx >= 0
     ]
-
-    tokens = list(jieba.cut(search_text))
-    bm25_scores = bm25.get_scores(tokens)
-    bm25_ranked = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:TOP_K]
-
-    fused = _rrf_combine([semantic_ranked, bm25_ranked])[:TOP_K]
-    if not fused:
+    if not relevant:
         return "", False
 
-    parts = [f"[来源: {chunks[i]['source']}]\n{chunks[i]['text']}" for i in fused]
+    parts = [f"[来源: {chunks[idx]['source']}]\n{chunks[idx]['text']}" for _, idx in relevant]
     return "\n\n---\n\n".join(parts), True
 
 
-def build_augmented_message(query: str, history: list, chunks: list, faiss_index, embed_model, bm25) -> str:
-    context, has_content = retrieve_context(query, history, chunks, faiss_index, embed_model, bm25)
+def build_augmented_message(query: str, history: list, chunks: list, index, embed_model) -> str:
+    context, has_content = retrieve_context(query, history, chunks, index, embed_model)
     if has_content:
         return f"以下是老师材料中可能相关的内容：\n\n{context}\n\n---\n\n学生问题：{query}"
     return (
@@ -172,8 +148,8 @@ def main():
     st.set_page_config(page_title="元吾氏 AI助教", page_icon="📚")
     st.title("📚 元吾氏 AI助教")
 
-    state, client, system_instruction, chunks, faiss_index, bm25, embed_model = load_resources()
-    st.caption(f"知识库：{len(chunks)} 个文本块 · 混合检索（语义 + 关键词）")
+    state, client, system_instruction, chunks, index, embed_model = load_resources()
+    st.caption(f"知识库：{len(chunks)} 个文本块 · 语义检索（中英文）")
 
     if "history" not in st.session_state:
         st.session_state.history = []
@@ -197,7 +173,7 @@ def main():
         st.markdown(user_input)
 
     augmented = build_augmented_message(
-        user_input, st.session_state.history, chunks, faiss_index, embed_model, bm25
+        user_input, st.session_state.history, chunks, index, embed_model
     )
     trimmed_history = st.session_state.history[-(MAX_HISTORY_TURNS * 2):]
     api_messages = trimmed_history + [{"role": "user", "content": augmented}]
