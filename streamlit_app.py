@@ -64,11 +64,11 @@ def retrieve_context(
     index: faiss.IndexFlatIP,
     embed_model: SentenceTransformer,
 ) -> tuple[str, bool]:
-    recent = " ".join(
-        msg["content"] if isinstance(msg["content"], str) else ""
-        for msg in history[-4:]
+    recent_user_qs = " ".join(
+        msg["content"] for msg in history[-4:]
+        if msg.get("role") == "user" and isinstance(msg["content"], str)
     )
-    search_text = (query + " " + recent).strip()
+    search_text = (query + " " + recent_user_qs).strip()
     query_vec = embed_model.encode([search_text], normalize_embeddings=True).astype(np.float32)
     scores, indices = index.search(query_vec, TOP_K)
 

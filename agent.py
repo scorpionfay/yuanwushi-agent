@@ -89,11 +89,14 @@ def retrieve_context(
     model: SentenceTransformer,
 ) -> tuple[str, bool]:
     """Returns (context_string, has_relevant_content)."""
-    recent = " ".join(
-        msg["content"] if isinstance(msg["content"], str) else ""
-        for msg in history[-4:]
+    # Only use recent USER questions for retrieval context (not assistant replies).
+    # Including assistant replies in the search vector skews retrieval toward the
+    # previous topic instead of the current question.
+    recent_user_qs = " ".join(
+        msg["content"] for msg in history[-4:]
+        if msg.get("role") == "user" and isinstance(msg["content"], str)
     )
-    search_text = (query + " " + recent).strip()
+    search_text = (query + " " + recent_user_qs).strip()
     query_vec = embed_texts([search_text], model).astype(np.float32)
 
     scores, indices = index.search(query_vec, TOP_K)
