@@ -16,6 +16,8 @@ import requests
 import pypdf
 import numpy as np
 import faiss
+import jieba
+from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -34,9 +36,10 @@ MODEL = "claude-haiku-4-5-20251001"
 EMBED_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 
 CHUNK_SIZE = 600  # max chars per chunk
-TOP_K = 8               # chunks to retrieve per query
+TOP_K = 8               # chunks to retrieve per query (each method)
+RRF_K = 60              # Reciprocal Rank Fusion constant
 MAX_HISTORY_TURNS = 10  # keep last N turns in API history
-MIN_RETRIEVAL_SCORE = 0.3  # cosine similarity threshold (0-1); below this = not relevant
+MIN_RETRIEVAL_SCORE = 0.2  # cosine similarity threshold; hybrid RRF raises effective bar
 
 
 # ── Text processing ────────────────────────────────────────────────────────────
@@ -100,7 +103,7 @@ def build_chunks(pdf_texts: list[dict], page_texts: list[dict]) -> list[dict]:
     return chunks
 
 
-# ── Semantic retrieval ─────────────────────────────────────────────────────────
+# ── Hybrid retrieval (semantic + BM25 → RRF) ──────────────────────────────────
 
 def load_embed_model() -> SentenceTransformer:
     print(f"📡 正在加载语义检索模型（{EMBED_MODEL}）…", end="", flush=True)
@@ -115,41 +118,64 @@ def embed_texts(texts: list[str], model: SentenceTransformer) -> np.ndarray:
 
 def build_faiss_index(embeddings: np.ndarray) -> faiss.IndexFlatIP:
     dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)  # inner product = cosine similarity on normalised vecs
+    index = faiss.IndexFlatIP(dim)
     index.add(embeddings.astype(np.float32))
     return index
+
+
+def build_bm25_index(chunks: list[dict]) -> BM25Okapi:
+    print("   正在构建 BM25 索引…", end="", flush=True)
+    corpus = [list(jieba.cut(c["text"])) for c in chunks]
+    bm25 = BM25Okapi(corpus)
+    print(" 完成")
+    return bm25
+
+
+def _rrf_combine(ranked_lists: list[list[int]]) -> list[int]:
+    """Reciprocal Rank Fusion: merge multiple ranked lists into one."""
+    scores: dict[int, float] = {}
+    for ranked in ranked_lists:
+        for rank, idx in enumerate(ranked):
+            scores[idx] = scores.get(idx, 0.0) + 1.0 / (RRF_K + rank + 1)
+    return sorted(scores, key=lambda i: scores[i], reverse=True)
 
 
 def retrieve_context(
     query: str,
     history: list,
     chunks: list[dict],
-    index: faiss.IndexFlatIP,
-    model: SentenceTransformer,
+    faiss_index: faiss.IndexFlatIP,
+    embed_model: SentenceTransformer,
+    bm25: BM25Okapi,
 ) -> tuple[str, bool]:
-    """Returns (context_string, has_relevant_content)."""
-    # Only use recent USER questions for retrieval context (not assistant replies).
-    # Including assistant replies in the search vector skews retrieval toward the
-    # previous topic instead of the current question.
+    """Hybrid retrieval: semantic + BM25, fused with RRF."""
+    # Only user questions for search context (not assistant replies — avoids topic skew)
     recent_user_qs = " ".join(
         msg["content"] for msg in history[-4:]
         if msg.get("role") == "user" and isinstance(msg["content"], str)
     )
     search_text = (query + " " + recent_user_qs).strip()
-    query_vec = embed_texts([search_text], model).astype(np.float32)
 
-    scores, indices = index.search(query_vec, TOP_K)
-    scores, indices = scores[0], indices[0]
-
-    relevant = [
-        (score, idx)
-        for score, idx in zip(scores, indices)
+    # Semantic search
+    query_vec = embed_texts([search_text], embed_model).astype(np.float32)
+    sem_scores, sem_indices = faiss_index.search(query_vec, TOP_K)
+    semantic_ranked = [
+        int(idx) for score, idx in zip(sem_scores[0], sem_indices[0])
         if score >= MIN_RETRIEVAL_SCORE and idx >= 0
     ]
-    if not relevant:
+
+    # BM25 keyword search
+    tokens = list(jieba.cut(search_text))
+    bm25_scores = bm25.get_scores(tokens)
+    bm25_ranked = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)[:TOP_K]
+
+    # Fuse with RRF and take top K
+    fused = _rrf_combine([semantic_ranked, bm25_ranked])[:TOP_K]
+
+    if not fused:
         return "", False
 
-    parts = [f"[来源: {chunks[idx]['source']}]\n{chunks[idx]['text']}" for _, idx in relevant]
+    parts = [f"[来源: {chunks[i]['source']}]\n{chunks[i]['text']}" for i in fused]
     return "\n\n---\n\n".join(parts), True
 
 
@@ -157,10 +183,11 @@ def augment_message(
     user_input: str,
     history: list,
     chunks: list[dict],
-    index: faiss.IndexFlatIP,
-    model: SentenceTransformer,
+    faiss_index: faiss.IndexFlatIP,
+    embed_model: SentenceTransformer,
+    bm25: BM25Okapi,
 ) -> str:
-    context, has_content = retrieve_context(user_input, history, chunks, index, model)
+    context, has_content = retrieve_context(user_input, history, chunks, faiss_index, embed_model, bm25)
     if has_content:
         return f"以下是老师材料中可能相关的内容：\n\n{context}\n\n---\n\n学生问题：{user_input}"
     else:
@@ -311,7 +338,7 @@ def build_system_instruction(state: dict, feedback_summary: str = "") -> str:
 2. 如果材料中确实找不到相关内容，直接告诉学生："这个问题在老师现有的材料中没有找到，建议直接向老师请教。" 不要编造。
 3. 来源引用灵活处理：当内容来自某本书或某篇文章时，自然地提一下出处即可（如"老师在意识强度一书中提到……"），不必每句话都标注。
 4. 讲解时可以有教学温度——适当引导学生思考、帮助他们建立概念之间的联系，但不做主观价值判断，不替学生下结论。
-5. 回答格式因问题而异：概念性问题（"什么是X""X是如何运作的"）用清晰的标题和要点组织，便于扫读；简单的追问或对话式问题直接自然作答，不要强行加标题。
+5. 回答格式因问题而异：概念性问题（"什么是X""X是如何运作的"）用清晰的标题和要点组织，便于扫读；简单的追问或对话式问题直接自然作答，不要强行加标题。如果材料中有具体数字、比例或规模描述，务必在回答中提及，这些数据是老师体系中重要的参考依据。
 6. 严禁混入任何宗教内容、宗教术语或宗教类比（佛教、道教、基督教、伊斯兰教等），老师的体系是独立的，不与任何宗教挂钩。
 7. 不要把其他思想体系、哲学流派或心理学理论混入老师的观点中，保持老师体系的纯粹性。"""
 
@@ -398,8 +425,9 @@ def chat():
 
     embed_model = load_embed_model()
     print("   正在构建向量索引…", end="", flush=True)
-    index = build_faiss_index(embeddings)
-    print(f" 完成（{index.ntotal} 个向量）")
+    faiss_index = build_faiss_index(embeddings)
+    print(f" 完成（{faiss_index.ntotal} 个向量）")
+    bm25 = build_bm25_index(chunks)
 
     client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
     print("🔍 正在分析历史反馈…", end="", flush=True)
@@ -409,7 +437,7 @@ def chat():
 
     teacher_name = state.get("teacher_name", TEACHER_NAME)
     print(f"\n{'='*50}")
-    print(f"  {teacher_name} (AI助教 · 语义检索)")
+    print(f"  {teacher_name} (AI助教 · 混合检索)")
     print(f"  已加载 {len(chunks)} 个知识块")
     print(f"  输入 'quit' 或 '退出' 结束对话")
     print(f"{'='*50}\n")
@@ -429,7 +457,7 @@ def chat():
             print("再见！")
             break
 
-        augmented = augment_message(user_input, history, chunks, index, embed_model)
+        augmented = augment_message(user_input, history, chunks, faiss_index, embed_model, bm25)
         trimmed_history = history[-(MAX_HISTORY_TURNS * 2):]
         api_messages = trimmed_history + [{"role": "user", "content": augmented}]
 
